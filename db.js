@@ -1,3 +1,5 @@
+// จุดเดียวที่ต่อกับฐานข้อมูล PostgreSQL — export ตัวแปร `pool` ตัวเดียวให้ index.js เรียก
+// pool.query(...) ใช้กับทุก endpoint ไม่มีไฟล์อื่นต่อฐานข้อมูลตรงๆ นอกจากไฟล์นี้
 import pg from "pg";
 import dotenv from "dotenv";
 

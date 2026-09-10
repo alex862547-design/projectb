@@ -1,3 +1,8 @@
+// Backend เดียวของทั้งระบบ (REST API) — ให้บริการทั้งฝั่งนักศึกษาและแอดมินในเว็บเดียวกัน (my-app/)
+// ผ่าน endpoint /api/* ทั้งหมด แบ่งเป็นกลุ่มตามทรัพยากร (teams, roles, students, matches, news,
+// event-days, checkins, attendance-messages) แต่ละกลุ่มมีทั้งเส้นทางที่ใครก็อ่านได้ (GET แบบ public)
+// และเส้นทางที่ต้องล็อกอิน/เป็นแอดมินเท่านั้น (ผ่าน middleware au()) ต่อฐานข้อมูล PostgreSQL ตัวเดียว
+// (db.js) ไม่มีการแคชข้อมูลไว้ที่ backend เอง ฝั่ง frontend เป็นคนโพลข้อมูลใหม่เองทุก 4 วินาที
 import express from "express";
 import cors from "cors";
 import jwt from "jsonwebtoken";
@@ -99,6 +104,7 @@ function auth(requiredRole) {
 }
 
 /* ---------------- AUTH ROUTES ---------------- */
+// ใช้โดย: หน้า Login.jsx (login) และ App.jsx ตอนเปิดแอปเช็คว่ามี token เดิมค้างอยู่ไหม (me)
 
 app.post("/api/auth/login", async (req, res) => {
   const { username, password } = req.body;
@@ -144,6 +150,7 @@ app.get("/api/auth/me", auth(), async (req, res) => {
 });
 
 /* ---------------- TEAMS (read-only) ---------------- */
+// ใช้โดย: Badge.jsx/teamById() (ทุกที่ในเว็บที่โชว์สีทีม), กล่อง "สีทีมที่มีในระบบ" ในหน้าแอดมิน AdminStudents.jsx
 app.get("/api/teams", async (req, res) => {
   const { rows } = await pool.query("SELECT * FROM teams ORDER BY id");
   res.json(rows);
@@ -167,6 +174,7 @@ app.patch("/api/teams/:id", auth("admin"), async (req, res) => {
 });
 
 /* ---------------- ROLES (ตำแหน่ง/ประเภทกีฬา) ---------------- */
+// ใช้โดย: กล่อง "ตำแหน่ง/ประเภทกีฬาที่มีในระบบ" ในหน้าแอดมิน AdminStudents.jsx, dropdown ตำแหน่งตอนเพิ่ม/แก้นักศึกษา
 app.get("/api/roles", async (req, res) => {
   const { rows } = await pool.query("SELECT name FROM roles ORDER BY id");
   res.json(rows.map((r) => r.name));
@@ -207,6 +215,7 @@ app.delete("/api/roles/:name", auth("admin"), async (req, res) => {
 });
 
 /* ---------------- STUDENT YEARS (ชั้นปี) ---------------- */
+// ใช้โดย: กล่อง "ชั้นปีที่มีในระบบ" ในหน้าแอดมิน AdminStudents.jsx, dropdown ชั้นปีตอนเพิ่ม/แก้นักศึกษา
 app.get("/api/student-years", async (req, res) => {
   const { rows } = await pool.query("SELECT label FROM student_years ORDER BY id");
   res.json(rows.map((r) => r.label));
@@ -247,6 +256,8 @@ app.delete("/api/student-years/:label", auth("admin"), async (req, res) => {
 });
 
 /* ---------------- STUDENTS ---------------- */
+// ใช้โดย: หน้าแอดมิน AdminStudents.jsx (เพิ่ม/แก้/ลบ/มอบสิทธิ์เช็คชื่อ) และหน้า TeamRoles.jsx ฝั่งนักศึกษา
+// (เจ้าหน้าที่ทีมแก้ตำแหน่งเพื่อนได้) รวมถึงทุกหน้าที่ต้องโชว์รายชื่อ/ค้นหานักศึกษา
 
 // จำกัดจำนวนนักศึกษาต่อสีตามประเภทตำแหน่ง:
 // - "นักกีฬา..." (ตำแหน่งที่ผูกกับกีฬาใดกีฬาหนึ่ง) ได้สีละไม่เกิน 10 คน
@@ -369,6 +380,8 @@ app.delete("/api/students/:id", auth("admin"), async (req, res) => {
 });
 
 /* ---------------- MATCHES ---------------- */
+// ใช้โดย: หน้าแอดมิน AdminMatches.jsx (สร้าง/แก้ผลแข่ง), Bracket.jsx + MatchSchedule.jsx ฝั่งนักศึกษา
+// (โชว์สายการแข่งขัน), Standings.jsx (นับแชมป์), UserCheckin.jsx (หาแมตช์วันนี้ของกีฬาที่จะเช็คชื่อ)
 app.get("/api/matches", async (req, res) => {
   const { rows } = await pool.query("SELECT * FROM matches ORDER BY date, time");
   res.json(rows.map(mapMatch));
@@ -418,6 +431,7 @@ app.delete("/api/matches/:id", auth("admin"), async (req, res) => {
 });
 
 /* ---------------- NEWS ---------------- */
+// ใช้โดย: หน้าแอดมิน AdminNews.jsx (ประกาศ/ลบข่าว), UserHome.jsx + GuestHome.jsx (โชว์ข่าวล่าสุด), TodaySummary.jsx
 app.get("/api/news", async (req, res) => {
   const { rows } = await pool.query("SELECT * FROM news ORDER BY date DESC, id DESC");
   res.json(rows.map(mapNews));
@@ -439,6 +453,8 @@ app.delete("/api/news/:id", auth("admin"), async (req, res) => {
 });
 
 /* ---------------- EVENT DAYS (ปฏิทินวันจัดกิจกรรม) ---------------- */
+// ใช้โดย: หน้าแอดมิน AdminEventDays.jsx (กำหนดวัน) และปฏิทินในหน้า UserHistory.jsx ฝั่งนักศึกษา
+// (ตัดสินว่าวันไหนควรนับว่ามา/ขาด/ยังไม่เริ่ม)
 app.get("/api/event-days", async (req, res) => {
   const { rows } = await pool.query("SELECT * FROM event_days ORDER BY date");
   res.json(rows.map(mapEventDay));
@@ -488,6 +504,8 @@ app.delete("/api/event-days/:id", auth("admin"), async (req, res) => {
 });
 
 /* ---------------- CHECKINS ---------------- */
+// ใช้โดย: หน้า UserCheckin.jsx (เจ้าหน้าที่ทีมกดเช็คชื่อ/เช็คขาดเพื่อนในสี), UserHistory.jsx (โชว์ประวัติ),
+// TodaySummary.jsx (นับจำนวนเช็คชื่อวันนี้)
 app.get("/api/checkins", async (req, res) => {
   const { rows } = await pool.query("SELECT * FROM checkins ORDER BY id");
   res.json(rows.map(mapCheckin));
@@ -555,6 +573,8 @@ app.post("/api/checkins", auth(), async (req, res) => {
 });
 
 /* ---------------- ATTENDANCE MESSAGES (สนทนาเรื่องการเช็คชื่อ/เช็คขาด) ---------------- */
+// ใช้โดย: AttendanceThreadModal.jsx (ป็อปอัปแชท เปิดจาก UserCheckin.jsx และ UserHistory.jsx)
+// unread-count ใช้โชว์เลขแดงที่แท็บ "ประวัติของฉัน" ใน Shell.jsx (ผ่าน App.jsx)
 // ดูข้อความของนักศึกษาคนหนึ่งในวันหนึ่ง — เจ้าตัว, ผู้มีสิทธิ์เช็คชื่อในสีเดียวกัน, หรือแอดมินเท่านั้นที่ดูได้
 app.get("/api/attendance-messages", auth(), async (req, res) => {
   const { studentId, date } = req.query;
