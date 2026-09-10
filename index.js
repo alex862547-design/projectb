@@ -572,6 +572,20 @@ app.post("/api/checkins", auth(), async (req, res) => {
   }
 });
 
+// ยกเลิกรายการเช็คชื่อ/เช็คขาดที่บันทึกผิด — ใช้สิทธิ์เดียวกับตอนเช็คชื่อ (ตัวเอง/แอดมิน/เจ้าหน้าที่ทีมในสีเดียวกัน)
+// ลบแล้วนักศึกษาคนนั้นกลับไปสถานะ "ยังไม่เช็คชื่อ" ทันที ทำให้เช็คใหม่ได้เลยโดยไม่ต้องรอแอดมิน
+app.delete("/api/checkins/:id", auth(), async (req, res) => {
+  const { rows } = await pool.query("SELECT student_id FROM checkins WHERE id = $1", [req.params.id]);
+  const record = rows[0];
+  if (!record) return res.status(404).json({ message: "ไม่พบรายการเช็คชื่อนี้" });
+
+  const allowed = await assertCanActOnStudent(req, res, record.student_id);
+  if (!allowed) return;
+
+  await pool.query("DELETE FROM checkins WHERE id = $1", [req.params.id]);
+  res.json({ ok: true });
+});
+
 /* ---------------- ATTENDANCE MESSAGES (สนทนาเรื่องการเช็คชื่อ/เช็คขาด) ---------------- */
 // ใช้โดย: AttendanceThreadModal.jsx (ป็อปอัปแชท เปิดจาก UserCheckin.jsx และ UserHistory.jsx)
 // unread-count ใช้โชว์เลขแดงที่แท็บ "ประวัติของฉัน" ใน Shell.jsx (ผ่าน App.jsx)
