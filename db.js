@@ -5,13 +5,14 @@ dotenv.config();
 
 const { Pool } = pg;
 
-// ฐานข้อมูลบน Render (หรือผู้ให้บริการคลาวด์อื่นๆ) ต้องต่อผ่าน SSL เสมอ
-// ส่วน localhost ตอนพัฒนาเครื่องตัวเองไม่ต้องใช้ SSL จึงเช็คจาก connection string อัตโนมัติ
-const isLocalDb = /localhost|127\.0\.0\.1/.test(process.env.DATABASE_URL || "");
+// ฐานข้อมูลคลาวด์ (Neon/Render ฯลฯ) จะมี sslmode=require ติดมาใน connection string เสมอ ต้องต่อผ่าน SSL
+// ส่วนฐานข้อมูลในเครื่องหรือใน container เดียวกัน (localhost, หรือ service ชื่อ "db" ตอนรันด้วย Docker Compose)
+// ไม่มี sslmode ติดมา จึงไม่ต้องเปิด SSL — เช็คจาก connection string เองแทนการเดาจากชื่อโฮสต์
+const needsSSL = /sslmode=require/i.test(process.env.DATABASE_URL || "");
 
 export const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
-  ssl: isLocalDb ? false : { rejectUnauthorized: false },
+  ssl: needsSSL ? { rejectUnauthorized: false } : false,
 });
 
 pool.on("error", (err) => {
