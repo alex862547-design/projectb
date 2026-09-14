@@ -46,6 +46,8 @@ const mapNews = (row) => ({
   body: row.body,
 });
 
+// checked_by_name/checked_by_student_id/checked_by_role มาจาก LEFT JOIN กับ users ตรง query ที่เรียกใช้ฟังก์ชันนี้
+// (ไม่ได้อยู่ในตาราง checkins เอง) เป็น null ทั้งหมดถ้าแถวนี้ไม่มีคนบันทึกไว้ว่าใครเช็ค (ข้อมูลเก่าก่อนมีฟีเจอร์นี้)
 const mapCheckin = (row) => ({
   id: row.id,
   studentId: row.student_id,
@@ -53,6 +55,13 @@ const mapCheckin = (row) => ({
   time: row.time,
   date: toDateStr(row.date),
   status: row.status || "present",
+  checkedBy: row.checked_by_id
+    ? {
+        name: row.checked_by_name,
+        code: row.checked_by_role === "admin" ? null : row.checked_by_student_id,
+        isAdmin: row.checked_by_role === "admin",
+      }
+    : null,
 });
 
 const mapAttendanceMessage = (row) => ({
@@ -505,9 +514,15 @@ app.delete("/api/event-days/:id", auth("admin"), async (req, res) => {
 
 /* ---------------- CHECKINS ---------------- */
 // ใช้โดย: หน้า UserCheckin.jsx (เจ้าหน้าที่ทีมกดเช็คชื่อ/เช็คขาดเพื่อนในสี), UserHistory.jsx (โชว์ประวัติ),
-// TodaySummary.jsx (นับจำนวนเช็คชื่อวันนี้)
+// TodaySummary.jsx (นับจำนวนเช็คชื่อวันนี้), AttendanceThreadModal.jsx (โชว์ชื่อ+รหัสผู้เช็คชื่อในหัวหน้าต่างข้อความ)
+const CHECKINS_WITH_CHECKER_SQL = `
+  SELECT c.*, u.display_name AS checked_by_name, u.student_id AS checked_by_student_id, u.role AS checked_by_role
+  FROM checkins c
+  LEFT JOIN users u ON u.id = c.checked_by_id
+`;
+
 app.get("/api/checkins", async (req, res) => {
-  const { rows } = await pool.query("SELECT * FROM checkins ORDER BY id");
+  const { rows } = await pool.query(`${CHECKINS_WITH_CHECKER_SQL} ORDER BY c.id`);
   res.json(rows.map(mapCheckin));
 });
 
@@ -562,11 +577,13 @@ app.post("/api/checkins", auth(), async (req, res) => {
 
   try {
     // บันทึก "วันที่จริงตอนนี้" ลงไปด้วย (ไม่ใช่แค่เวลา) เพื่อให้ดูปฏิทินย้อนหลังได้
+    // checked_by_id = req.user.id เก็บไว้ว่าใครเป็นคนกดเช็คให้ (ตัวเอง/เจ้าหน้าที่ทีม/แอดมิน) เอาไว้โชว์ในหน้าต่างข้อความทีหลัง
     const { rows } = await pool.query(
-      "INSERT INTO checkins (student_id, match_id, time, date, status) VALUES ($1,$2,$3, CURRENT_DATE, $4) RETURNING *",
-      [studentId, matchId ?? null, time || null, finalStatus]
+      "INSERT INTO checkins (student_id, match_id, time, date, status, checked_by_id) VALUES ($1,$2,$3, CURRENT_DATE, $4, $5) RETURNING id",
+      [studentId, matchId ?? null, time || null, finalStatus, req.user.id]
     );
-    res.status(201).json(mapCheckin(rows[0]));
+    const { rows: withChecker } = await pool.query(`${CHECKINS_WITH_CHECKER_SQL} WHERE c.id = $1`, [rows[0].id]);
+    res.status(201).json(mapCheckin(withChecker[0]));
   } catch (err) {
     res.status(400).json({ message: err.message });
   }
