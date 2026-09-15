@@ -624,6 +624,24 @@ app.delete("/api/checkins/:id", auth(), async (req, res) => {
   res.json({ ok: true });
 });
 
+// แอดมินแก้ไขรายการเช็คชื่อ/เช็คขาดที่บันทึกไว้แล้วได้ (เช่น เช็คผิดสถานะ, เวลาผิด, วันที่ผิด) ใช้ในหน้า
+// "จัดการเช็คชื่อ" (AdminCheckins.jsx) — เฉพาะแอดมินเท่านั้น ผู้เช็คชื่อทั่วไปแก้ของที่เช็คไปแล้วไม่ได้ ต้อง
+// ยกเลิก (DELETE) แล้วเช็คใหม่เอง
+app.put("/api/checkins/:id", auth("admin"), async (req, res) => {
+  const { status, time, date } = req.body;
+  const { rows } = await pool.query(
+    `UPDATE checkins
+     SET status = COALESCE($1, status),
+         time   = COALESCE($2, time),
+         date   = COALESCE($3, date)
+     WHERE id = $4 RETURNING id`,
+    [status ?? null, time ?? null, date ?? null, req.params.id]
+  );
+  if (!rows[0]) return res.status(404).json({ message: "ไม่พบรายการเช็คชื่อนี้" });
+  const { rows: withChecker } = await pool.query(`${CHECKINS_WITH_CHECKER_SQL} WHERE c.id = $1`, [rows[0].id]);
+  res.json(mapCheckin(withChecker[0]));
+});
+
 /* ---------------- ATTENDANCE MESSAGES (สนทนาเรื่องการเช็คชื่อ/เช็คขาด) ---------------- */
 // ใช้โดย: AttendanceThreadModal.jsx (ป็อปอัปแชท เปิดจาก UserCheckin.jsx และ UserHistory.jsx),
 // MessageInboxModal.jsx (กล่องข้อความรวมทุกห้องแชท ใช้ /threads กับ /checker-unread-count)
