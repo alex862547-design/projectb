@@ -565,22 +565,35 @@ async function assertCanActOnStudent(req, res, studentId) {
 // ต้องล็อกอินก่อนถึงจะเช็คชื่อได้
 // นักศึกษาเช็คชื่อได้เฉพาะถ้าตัวเองได้รับสิทธิ์ (can_checkin) และเช็คได้เฉพาะคนในสีเดียวกันเท่านั้น
 // แอดมินเช็คชื่อได้ทุกคน (ไม่ติดข้อจำกัดสี)
+// ส่ง `date` มาด้วยได้ (YYYY-MM-DD) เพื่อเช็คชื่อ "ย้อนหลัง" — ต้องไม่เกินวันนี้ (เช็คล่วงหน้าอนาคตไม่ได้)
+// ไม่ส่งมาก็ยังใช้วันนี้ตามเดิม (ตรวจสอบวันที่ฝั่ง server เอง ไม่เชื่อวันที่จากเครื่องผู้ใช้ที่ตั้งผิดได้)
 app.post("/api/checkins", auth(), async (req, res) => {
-  const { studentId, matchId, time, status } = req.body;
+  const { studentId, matchId, time, status, date } = req.body;
   if (!studentId) {
     return res.status(400).json({ message: "ต้องระบุ studentId" });
   }
   const finalStatus = status === "absent" ? "absent" : "present";
 
+  let finalDate = null; // null -> ให้ query ใช้ CURRENT_DATE
+  if (date) {
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) {
+      return res.status(400).json({ message: "รูปแบบวันที่ไม่ถูกต้อง" });
+    }
+    const { rows: nowRows } = await pool.query("SELECT CURRENT_DATE AS today");
+    if (date > toDateStr(nowRows[0].today)) {
+      return res.status(400).json({ message: "เช็คชื่อล่วงหน้าไม่ได้ เลือกได้แค่วันนี้หรือวันที่ผ่านมาแล้ว" });
+    }
+    finalDate = date;
+  }
+
   const allowed = await assertCanActOnStudent(req, res, studentId);
   if (!allowed) return;
 
   try {
-    // บันทึก "วันที่จริงตอนนี้" ลงไปด้วย (ไม่ใช่แค่เวลา) เพื่อให้ดูปฏิทินย้อนหลังได้
     // checked_by_id = req.user.id เก็บไว้ว่าใครเป็นคนกดเช็คให้ (ตัวเอง/เจ้าหน้าที่ทีม/แอดมิน) เอาไว้โชว์ในหน้าต่างข้อความทีหลัง
     const { rows } = await pool.query(
-      "INSERT INTO checkins (student_id, match_id, time, date, status, checked_by_id) VALUES ($1,$2,$3, CURRENT_DATE, $4, $5) RETURNING id",
-      [studentId, matchId ?? null, time || null, finalStatus, req.user.id]
+      "INSERT INTO checkins (student_id, match_id, time, date, status, checked_by_id) VALUES ($1,$2,$3, COALESCE($4, CURRENT_DATE), $5, $6) RETURNING id",
+      [studentId, matchId ?? null, time || null, finalDate, finalStatus, req.user.id]
     );
     const { rows: withChecker } = await pool.query(`${CHECKINS_WITH_CHECKER_SQL} WHERE c.id = $1`, [rows[0].id]);
     res.status(201).json(mapCheckin(withChecker[0]));
@@ -604,8 +617,10 @@ app.delete("/api/checkins/:id", auth(), async (req, res) => {
 });
 
 /* ---------------- ATTENDANCE MESSAGES (สนทนาเรื่องการเช็คชื่อ/เช็คขาด) ---------------- */
-// ใช้โดย: AttendanceThreadModal.jsx (ป็อปอัปแชท เปิดจาก UserCheckin.jsx และ UserHistory.jsx)
-// unread-count ใช้โชว์เลขแดงที่แท็บ "ประวัติของฉัน" ใน Shell.jsx (ผ่าน App.jsx)
+// ใช้โดย: AttendanceThreadModal.jsx (ป็อปอัปแชท เปิดจาก UserCheckin.jsx และ UserHistory.jsx),
+// MessageInboxModal.jsx (กล่องข้อความรวมทุกห้องแชท ใช้ /threads กับ /checker-unread-count)
+// unread-count ใช้โชว์เลขแดงที่แท็บ "ประวัติของฉัน" (ฝั่งนักศึกษา) ส่วน checker-unread-count ใช้โชว์เลขแดงที่ปุ่ม
+// "กล่องข้อความ" กับแท็บ "เช็คชื่อกิจกรรม" (ฝั่งผู้เช็คชื่อ) ใน Shell.jsx (ผ่าน App.jsx)
 // ดูข้อความของนักศึกษาคนหนึ่งในวันหนึ่ง — เจ้าตัว, ผู้มีสิทธิ์เช็คชื่อในสีเดียวกัน, หรือแอดมินเท่านั้นที่ดูได้
 app.get("/api/attendance-messages", auth(), async (req, res) => {
   const { studentId, date } = req.query;
@@ -620,10 +635,18 @@ app.get("/api/attendance-messages", auth(), async (req, res) => {
     [studentId, date]
   );
 
-  // เจ้าตัวเปิดดูข้อความของตัวเอง = ถือว่าอ่านข้อความฝั่งผู้เช็คชื่อ (checker) ในวันนี้แล้วทั้งหมด
-  if (req.user.role === "student" && studentId === req.user.studentId) {
+  const isOwner = req.user.role === "student" && studentId === req.user.studentId;
+  if (isOwner) {
+    // เจ้าตัวเปิดดูข้อความของตัวเอง = ถือว่าอ่านข้อความฝั่งผู้เช็คชื่อ (checker) วันนั้นแล้วทั้งหมด
     await pool.query(
       "UPDATE attendance_messages SET is_read = TRUE WHERE student_id = $1 AND date = $2 AND sender_role = 'checker' AND is_read = FALSE",
+      [studentId, date]
+    );
+  } else {
+    // แอดมิน/เจ้าหน้าที่ทีม เปิดดูข้อความของคนอื่นในฐานะผู้เช็คชื่อ (ผ่าน assertCanActOnStudent ด้านบนมาแล้ว)
+    // = ถือว่าอ่านข้อความที่นักศึกษาตอบกลับมาแล้วทั้งหมด (ใช้ลดเลขแดงในกล่องข้อความ/แท็บเช็คชื่อกิจกรรม)
+    await pool.query(
+      "UPDATE attendance_messages SET is_read = TRUE WHERE student_id = $1 AND date = $2 AND sender_role = 'student' AND is_read = FALSE",
       [studentId, date]
     );
   }
@@ -641,6 +664,91 @@ app.get("/api/attendance-messages/unread-count", auth(), async (req, res) => {
     [req.user.studentId]
   );
   res.json({ count: rows[0]?.count || 0 });
+});
+
+// รายชื่อ "ห้องแชท" (นักศึกษา 1 คน x วันที่ 1 วัน = 1 ห้อง) ทั้งหมดที่ผู้เช็คชื่อคนนี้เข้าถึงได้ — แอดมินเห็นทุกคน
+// เจ้าหน้าที่ทีมเห็นเฉพาะคนในสีเดียวกัน เรียงจากข้อความล่าสุดก่อน พร้อมตัวอย่างข้อความล่าสุด+จำนวนที่ยังไม่อ่าน
+// ใช้โดย: MessageInboxModal.jsx (ปุ่ม "กล่องข้อความ" ในหน้าเช็คชื่อกิจกรรม)
+app.get("/api/attendance-messages/threads", auth(), async (req, res) => {
+  let teamFilter = "";
+  const params = [];
+  if (req.user.role === "admin") {
+    // แอดมินเห็นทุกห้องแชท ไม่ต้องกรองสี
+  } else if (req.user.role === "student" && req.user.studentId) {
+    const { rows: meRows } = await pool.query("SELECT team, can_checkin FROM students WHERE id = $1", [req.user.studentId]);
+    const me = meRows[0];
+    if (!me || !me.can_checkin) {
+      return res.status(403).json({ message: "คุณไม่ได้รับสิทธิ์ให้เช็คชื่อ กรุณาติดต่อผู้ดูแลระบบ" });
+    }
+    teamFilter = "AND s.team = $1";
+    params.push(me.team);
+  } else {
+    return res.status(403).json({ message: "คุณไม่มีสิทธิ์เข้าดูกล่องข้อความนี้" });
+  }
+
+  const { rows } = await pool.query(
+    `
+    WITH thread AS (
+      SELECT student_id, date, MAX(created_at) AS last_at
+      FROM attendance_messages
+      GROUP BY student_id, date
+    )
+    SELECT t.student_id, t.date, t.last_at, s.name AS student_name,
+      lm.message AS last_message, lm.sender_role AS last_sender_role,
+      COALESCE(uc.unread, 0)::int AS unread_count
+    FROM thread t
+    JOIN students s ON s.id = t.student_id
+    JOIN LATERAL (
+      SELECT message, sender_role FROM attendance_messages
+      WHERE student_id = t.student_id AND date = t.date
+      ORDER BY created_at DESC, id DESC LIMIT 1
+    ) lm ON true
+    LEFT JOIN LATERAL (
+      SELECT COUNT(*) AS unread FROM attendance_messages
+      WHERE student_id = t.student_id AND date = t.date AND sender_role = 'student' AND is_read = FALSE
+    ) uc ON true
+    WHERE 1=1 ${teamFilter}
+    ORDER BY t.last_at DESC
+    LIMIT 200
+    `,
+    params
+  );
+
+  res.json(
+    rows.map((r) => ({
+      studentId: r.student_id,
+      studentName: r.student_name,
+      date: toDateStr(r.date),
+      lastMessage: r.last_message,
+      lastSenderRole: r.last_sender_role,
+      lastAt: r.last_at,
+      unreadCount: r.unread_count,
+    }))
+  );
+});
+
+// จำนวนข้อความที่นักศึกษาตอบกลับมาแล้วผู้เช็คชื่อยังไม่ได้เปิดอ่าน รวมทุกห้องแชทที่เข้าถึงได้ (แอดมิน = ทั้งหมด,
+// เจ้าหน้าที่ทีม = เฉพาะสีตัวเอง) โชว์เลขแดงที่ปุ่ม "กล่องข้อความ" และแท็บ "เช็คชื่อกิจกรรม"
+app.get("/api/attendance-messages/checker-unread-count", auth(), async (req, res) => {
+  if (req.user.role === "admin") {
+    const { rows } = await pool.query(
+      "SELECT COUNT(*)::int AS count FROM attendance_messages WHERE sender_role = 'student' AND is_read = FALSE"
+    );
+    return res.json({ count: rows[0]?.count || 0 });
+  }
+  if (req.user.role === "student" && req.user.studentId) {
+    const { rows: meRows } = await pool.query("SELECT team, can_checkin FROM students WHERE id = $1", [req.user.studentId]);
+    const me = meRows[0];
+    if (!me || !me.can_checkin) return res.json({ count: 0 });
+    const { rows } = await pool.query(
+      `SELECT COUNT(*)::int AS count FROM attendance_messages m
+       JOIN students s ON s.id = m.student_id
+       WHERE m.sender_role = 'student' AND m.is_read = FALSE AND s.team = $1`,
+      [me.team]
+    );
+    return res.json({ count: rows[0]?.count || 0 });
+  }
+  res.json({ count: 0 });
 });
 
 // ส่งข้อความใหม่ในวันนั้นๆ — ถ้าคนส่งคือเจ้าตัว sender_role = "student" มิฉะนั้นเป็น "checker"
