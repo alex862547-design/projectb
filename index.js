@@ -324,8 +324,8 @@ app.post("/api/students", auth("admin"), async (req, res) => {
 });
 
 // แอดมินแก้ได้ทุกฟิลด์ของนักศึกษาคนไหนก็ได้
-// นักศึกษาที่มีสิทธิ์เช็คชื่อ (can_checkin) แก้ได้แค่ฟิลด์ "role" (ตำแหน่ง/กีฬา)
-// และแก้ได้เฉพาะนักศึกษาในสังกัดสีเดียวกับตัวเองเท่านั้น
+// เฉพาะนักศึกษาที่เป็น "หัวหน้าสี" และมีสิทธิ์เช็คชื่อ (can_checkin) เท่านั้นที่แก้ฟิลด์ "role" (ตำแหน่ง/กีฬา)
+// ของคนอื่นได้ (นักศึกษาที่มีสิทธิ์เช็คชื่อตำแหน่งอื่นๆ ไม่มีสิทธิ์นี้แล้ว) และแก้ได้เฉพาะคนในสังกัดสีเดียวกันเท่านั้น
 app.put("/api/students/:id", auth(), async (req, res) => {
   let { name, team, role, canCheckin, year } = req.body;
 
@@ -333,12 +333,15 @@ app.put("/api/students/:id", auth(), async (req, res) => {
     // ไม่ต้องทำอะไรเพิ่ม ใช้ค่าที่ส่งมาได้ทุกฟิลด์
   } else if (req.user.role === "student") {
     const { rows: meRows } = await pool.query(
-      "SELECT team, can_checkin FROM students WHERE id = $1",
+      "SELECT team, role, can_checkin FROM students WHERE id = $1",
       [req.user.studentId]
     );
     const me = meRows[0];
     if (!me || !me.can_checkin) {
       return res.status(403).json({ message: "คุณไม่มีสิทธิ์แก้ไขข้อมูลนักศึกษา" });
+    }
+    if (me.role !== "หัวหน้าสี") {
+      return res.status(403).json({ message: "เฉพาะหัวหน้าสีเท่านั้นที่ปรับตำแหน่งของนักศึกษาคนอื่นได้" });
     }
     const { rows: targetRows } = await pool.query(
       "SELECT team FROM students WHERE id = $1",
@@ -529,7 +532,8 @@ app.get("/api/checkins", async (req, res) => {
 // ตรวจสอบว่า req.user มีสิทธิ์ "เช็คชื่อ/เช็คขาด/ส่งข้อความ" แทนนักศึกษาคนนี้ได้หรือไม่
 // - ตัวเองเช็ค/เขียนถึงตัวเองได้เสมอ
 // - แอดมินทำได้กับทุกคน
-// - นักศึกษาที่มีสิทธิ์ can_checkin ทำได้เฉพาะเพื่อนในสังกัดสีเดียวกัน
+// - "หัวหน้าสี" ที่มีสิทธิ์ can_checkin ทำได้กับทุกตำแหน่งในสีเดียวกัน (คุมทั้งสี)
+// - นักศึกษาที่มีสิทธิ์ can_checkin ตำแหน่งอื่นๆ ทำได้เฉพาะคนในสีเดียวกัน "และ" ตำแหน่ง/กีฬาเดียวกับตัวเองเท่านั้น
 async function assertCanActOnStudent(req, res, studentId) {
   if (req.user.role === "student" && studentId === req.user.studentId) return true;
   if (req.user.role === "admin") return true;
@@ -540,7 +544,7 @@ async function assertCanActOnStudent(req, res, studentId) {
   }
 
   const { rows: meRows } = await pool.query(
-    "SELECT team, can_checkin FROM students WHERE id = $1",
+    "SELECT team, role, can_checkin FROM students WHERE id = $1",
     [req.user.studentId]
   );
   const me = meRows[0];
@@ -549,7 +553,7 @@ async function assertCanActOnStudent(req, res, studentId) {
     return false;
   }
 
-  const { rows: targetRows } = await pool.query("SELECT team FROM students WHERE id = $1", [studentId]);
+  const { rows: targetRows } = await pool.query("SELECT team, role FROM students WHERE id = $1", [studentId]);
   const target = targetRows[0];
   if (!target) {
     res.status(404).json({ message: "ไม่พบนักศึกษาคนนี้" });
@@ -557,6 +561,10 @@ async function assertCanActOnStudent(req, res, studentId) {
   }
   if (target.team !== me.team) {
     res.status(403).json({ message: "ทำรายการได้เฉพาะนักศึกษาในสังกัดสีเดียวกันเท่านั้น" });
+    return false;
+  }
+  if (me.role !== "หัวหน้าสี" && target.role !== me.role) {
+    res.status(403).json({ message: "ทำรายการได้เฉพาะนักศึกษาในตำแหน่ง/กีฬาเดียวกับคุณเท่านั้น" });
     return false;
   }
   return true;
@@ -660,21 +668,27 @@ app.get("/api/attendance-messages/unread-count", auth(), async (req, res) => {
 });
 
 // รายชื่อ "ห้องแชท" (นักศึกษา 1 คน x วันที่ 1 วัน = 1 ห้อง) ทั้งหมดที่ผู้เช็คชื่อคนนี้เข้าถึงได้ — แอดมินเห็นทุกคน
-// เจ้าหน้าที่ทีมเห็นเฉพาะคนในสีเดียวกัน เรียงจากข้อความล่าสุดก่อน พร้อมตัวอย่างข้อความล่าสุด+จำนวนที่ยังไม่อ่าน
-// ใช้โดย: MessageInboxModal.jsx (ปุ่ม "กล่องข้อความ" ในหน้าเช็คชื่อกิจกรรม)
+// หัวหน้าสีเห็นทุกตำแหน่งในสีเดียวกัน ส่วนคนอื่นเห็นแค่คนในสีเดียวกัน "และ" ตำแหน่งเดียวกับตัวเองเท่านั้น (ตรงกับ
+// ขอบเขตที่เช็คชื่อได้จริงใน assertCanActOnStudent กันไม่ให้กล่องข้อความโชว์ห้องที่กดเข้าไปแล้วจะโดนปฏิเสธ)
+// เรียงจากข้อความล่าสุดก่อน พร้อมตัวอย่างข้อความล่าสุด+จำนวนที่ยังไม่อ่าน — ใช้โดย: MessageInboxModal.jsx
 app.get("/api/attendance-messages/threads", auth(), async (req, res) => {
   let teamFilter = "";
   const params = [];
   if (req.user.role === "admin") {
-    // แอดมินเห็นทุกห้องแชท ไม่ต้องกรองสี
+    // แอดมินเห็นทุกห้องแชท ไม่ต้องกรองสี/ตำแหน่ง
   } else if (req.user.role === "student" && req.user.studentId) {
-    const { rows: meRows } = await pool.query("SELECT team, can_checkin FROM students WHERE id = $1", [req.user.studentId]);
+    const { rows: meRows } = await pool.query("SELECT team, role, can_checkin FROM students WHERE id = $1", [req.user.studentId]);
     const me = meRows[0];
     if (!me || !me.can_checkin) {
       return res.status(403).json({ message: "คุณไม่ได้รับสิทธิ์ให้เช็คชื่อ กรุณาติดต่อผู้ดูแลระบบ" });
     }
-    teamFilter = "AND s.team = $1";
-    params.push(me.team);
+    if (me.role === "หัวหน้าสี") {
+      teamFilter = "AND s.team = $1";
+      params.push(me.team);
+    } else {
+      teamFilter = "AND s.team = $1 AND s.role = $2";
+      params.push(me.team, me.role);
+    }
   } else {
     return res.status(403).json({ message: "คุณไม่มีสิทธิ์เข้าดูกล่องข้อความนี้" });
   }
@@ -721,7 +735,7 @@ app.get("/api/attendance-messages/threads", auth(), async (req, res) => {
 });
 
 // จำนวนข้อความที่นักศึกษาตอบกลับมาแล้วผู้เช็คชื่อยังไม่ได้เปิดอ่าน รวมทุกห้องแชทที่เข้าถึงได้ (แอดมิน = ทั้งหมด,
-// เจ้าหน้าที่ทีม = เฉพาะสีตัวเอง) โชว์เลขแดงที่ปุ่ม "กล่องข้อความ" และแท็บ "เช็คชื่อกิจกรรม"
+// หัวหน้าสี = ทั้งสีตัวเอง, คนอื่น = เฉพาะสีและตำแหน่งเดียวกับตัวเอง) โชว์เลขแดงที่ปุ่ม "กล่องข้อความ" และแท็บ "เช็คชื่อกิจกรรม"
 app.get("/api/attendance-messages/checker-unread-count", auth(), async (req, res) => {
   if (req.user.role === "admin") {
     const { rows } = await pool.query(
@@ -730,14 +744,16 @@ app.get("/api/attendance-messages/checker-unread-count", auth(), async (req, res
     return res.json({ count: rows[0]?.count || 0 });
   }
   if (req.user.role === "student" && req.user.studentId) {
-    const { rows: meRows } = await pool.query("SELECT team, can_checkin FROM students WHERE id = $1", [req.user.studentId]);
+    const { rows: meRows } = await pool.query("SELECT team, role, can_checkin FROM students WHERE id = $1", [req.user.studentId]);
     const me = meRows[0];
     if (!me || !me.can_checkin) return res.json({ count: 0 });
+    const scopeFilter = me.role === "หัวหน้าสี" ? "" : "AND s.role = $2";
+    const params = me.role === "หัวหน้าสี" ? [me.team] : [me.team, me.role];
     const { rows } = await pool.query(
       `SELECT COUNT(*)::int AS count FROM attendance_messages m
        JOIN students s ON s.id = m.student_id
-       WHERE m.sender_role = 'student' AND m.is_read = FALSE AND s.team = $1`,
-      [me.team]
+       WHERE m.sender_role = 'student' AND m.is_read = FALSE AND s.team = $1 ${scopeFilter}`,
+      params
     );
     return res.json({ count: rows[0]?.count || 0 });
   }
