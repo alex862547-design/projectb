@@ -655,6 +655,24 @@ app.get("/api/attendance-messages", auth(), async (req, res) => {
   res.json(rows.map(mapAttendanceMessage));
 });
 
+// รายชื่อวันที่ที่มีข้อความอยู่จริงของนักศึกษาคนหนึ่ง (ไม่สนว่าอ่านแล้วหรือยัง) ใช้แสดงสัญลักษณ์ "มีข้อความ"
+// บนช่องปฏิทินหน้า "ประวัติของฉัน" (UserHistory.jsx) ให้ตรงกับความเป็นจริง แทนการเดาว่ามีข้อความจากแค่ว่า
+// วันนั้นมีการเช็คชื่อ/เช็คขาด (ซึ่งส่วนใหญ่ไม่มีข้อความคุยกันจริงๆ)
+app.get("/api/attendance-messages/dates", auth(), async (req, res) => {
+  const { studentId } = req.query;
+  if (!studentId) {
+    return res.status(400).json({ message: "ต้องระบุ studentId" });
+  }
+  const allowed = await assertCanActOnStudent(req, res, studentId);
+  if (!allowed) return;
+
+  const { rows } = await pool.query(
+    "SELECT DISTINCT date FROM attendance_messages WHERE student_id = $1",
+    [studentId]
+  );
+  res.json(rows.map((r) => toDateStr(r.date)));
+});
+
 // จำนวนข้อความใหม่ (ที่ผู้เช็คชื่อส่งมา แต่เจ้าตัวยังไม่ได้เปิดอ่าน) ใช้โชว์เลขแดงที่แถบ "ประวัติของฉัน"
 app.get("/api/attendance-messages/unread-count", auth(), async (req, res) => {
   if (req.user.role !== "student" || !req.user.studentId) {
