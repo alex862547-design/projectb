@@ -635,21 +635,14 @@ app.get("/api/attendance-messages", auth(), async (req, res) => {
     [studentId, date]
   );
 
-  const isOwner = req.user.role === "student" && studentId === req.user.studentId;
-  if (isOwner) {
-    // เจ้าตัวเปิดดูข้อความของตัวเอง = ถือว่าอ่านข้อความฝั่งผู้เช็คชื่อ (checker) วันนั้นแล้วทั้งหมด
-    await pool.query(
-      "UPDATE attendance_messages SET is_read = TRUE WHERE student_id = $1 AND date = $2 AND sender_role = 'checker' AND is_read = FALSE",
-      [studentId, date]
-    );
-  } else {
-    // แอดมิน/เจ้าหน้าที่ทีม เปิดดูข้อความของคนอื่นในฐานะผู้เช็คชื่อ (ผ่าน assertCanActOnStudent ด้านบนมาแล้ว)
-    // = ถือว่าอ่านข้อความที่นักศึกษาตอบกลับมาแล้วทั้งหมด (ใช้ลดเลขแดงในกล่องข้อความ/แท็บเช็คชื่อกิจกรรม)
-    await pool.query(
-      "UPDATE attendance_messages SET is_read = TRUE WHERE student_id = $1 AND date = $2 AND sender_role = 'student' AND is_read = FALSE",
-      [studentId, date]
-    );
-  }
+  // เปิดห้องแชทนี้ = ถือว่าอ่านข้อความทุกฝั่งในห้องนี้แล้ว (ไม่แยกฝั่งตาม role ผู้เปิด) เพราะถ้าคนคนเดียวกัน
+  // เป็นทั้ง "นักศึกษา" (เจ้าของ record) และ "ผู้เช็คชื่อ" (เช็คชื่อตัวเองในฐานะเพื่อนร่วมทีม) เช่น เจ้าหน้าที่ทีม
+  // เช็คชื่อตัวเอง — ถ้าแยกอ่านแค่ฝั่งเดียวตาม role จะมีข้อความอีกฝั่ง (ที่ตัวเองส่งในบทบาทนักศึกษา) ค้างเป็น
+  // unread ตลอดไปเพราะไม่มีใคร "อีกคน" มาเปิดอ่านให้ (เจอบั๊กนี้จริง: เลขแดงในกล่องข้อความไม่หายแม้เปิดดูแล้ว)
+  await pool.query(
+    "UPDATE attendance_messages SET is_read = TRUE WHERE student_id = $1 AND date = $2 AND is_read = FALSE",
+    [studentId, date]
+  );
 
   res.json(rows.map(mapAttendanceMessage));
 });
