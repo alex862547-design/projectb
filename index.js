@@ -2,15 +2,50 @@
 // ผ่าน endpoint /api/* ทั้งหมด แบ่งเป็นกลุ่มตามทรัพยากร (teams, roles, students, matches, news,
 // event-days, checkins, attendance-messages) แต่ละกลุ่มมีทั้งเส้นทางที่ใครก็อ่านได้ (GET แบบ public)
 // และเส้นทางที่ต้องล็อกอิน/เป็นแอดมินเท่านั้น (ผ่าน middleware au()) ต่อฐานข้อมูล PostgreSQL ตัวเดียว
-// (db.js) ไม่มีการแคชข้อมูลไว้ที่ backend เอง ฝั่ง frontend เป็นคนโพลข้อมูลใหม่เองทุก 4 วินาที
+// (db.js) เส้นทาง GET สาธารณะที่หน้าเว็บโพลใหม่ทุก 4 วิ (teams, roles, student-years, students, matches,
+// news, event-days, checkins) มีแคชสั้นๆในหน่วยความจำ (getCached ด้านล่าง) กันคนใช้พร้อมกันหลายสิบ/หลายร้อย
+// คนยิง query ซ้ำเดิมพร้อมกันทุกรอบโพล — endpoint ที่แก้ไขข้อมูลจะล้างแคชของตัวเองทันทีหลังบันทึกเสร็จเสมอ
 import express from "express";
 import cors from "cors";
+import compression from "compression";
 import jwt from "jsonwebtoken";
 import { pool } from "./db.js";
 
 const app = express();
 app.use(cors());
+app.use(compression());
 app.use(express.json());
+
+// กันเซิร์ฟเวอร์ทั้งตัวล่มถ้า query ไหนพลาด (เช่น pool หมด connection ตอนคนใช้พร้อมกันเยอะๆ จนต้องรอเกิน
+// connectionTimeoutMillis ที่ตั้งไว้ใน db.js) — endpoint ส่วนใหญ่ในไฟล์นี้ไม่ได้ครอบ try/catch ไว้ ถ้า query
+// พลาดแบบไม่มีใครจับ (unhandled rejection) Node เวอร์ชันใหม่จะ "ปิดโปรเซสทั้งตัวทันที" โดย default ซึ่งจะทำให้
+// ทุกคนที่ใช้อยู่หลุดพร้อมกันและต้องรอ Render restart ใหม่ (แย่กว่าคำขอเดียวช้า/พังมาก) ดักไว้ตรงนี้แทน —
+// แค่ log ไว้ ไม่ปิดโปรเซส ผลคือคำขอที่พลาดจริงๆอาจค้าง/ไม่ตอบกลับ (ฝั่งหน้าเว็บมี timeout/retry ของตัวเองอยู่แล้ว)
+// แต่เซิร์ฟเวอร์ยังทำงานต่อให้คนอื่นใช้ได้ตามปกติ ไม่ใช่ทุกคนหลุดพร้อมกัน
+process.on("unhandledRejection", (err) => {
+  console.error("Unhandled rejection (server ยังทำงานต่อ):", err);
+});
+process.on("uncaughtException", (err) => {
+  console.error("Uncaught exception (server ยังทำงานต่อ):", err);
+});
+
+// แคชสั้นๆในหน่วยความจำ (ไม่ใช้ Redis หรือบริการเสียเงินใดๆ) สำหรับ endpoint GET แบบ public ที่ข้อมูล
+// เหมือนกันไม่ว่าใครเรียก — เก็บเป็น "Promise ที่กำลังโหลด" ไม่ใช่ข้อมูลที่โหลดเสร็จแล้ว เพื่อรวมคำขอที่เข้ามา
+// พร้อมกันในช่วง TTL เดียวกันให้ยิง query จริงแค่ครั้งเดียว (request coalescing) ไม่ใช่แค่ลดจำนวนครั้งเฉยๆ
+// ตั้ง TTL ไว้สั้นกว่ารอบโพลของหน้าเว็บ (4 วิ) มาก จึงไม่ทำให้ข้อมูลดูเก่าเกินไปแม้ไม่มีการล้างแคชเลย
+const CACHE_TTL_MS = 3000;
+const cacheStore = new Map(); // key -> { promise, expiresAt }
+function getCached(key, loader) {
+  const hit = cacheStore.get(key);
+  if (hit && hit.expiresAt > Date.now()) return hit.promise;
+  const promise = Promise.resolve().then(loader);
+  promise.catch(() => cacheStore.delete(key)); // ไม่แคช error ไว้ ให้ลองใหม่ได้ทันทีในคำขอถัดไป
+  cacheStore.set(key, { promise, expiresAt: Date.now() + CACHE_TTL_MS });
+  return promise;
+}
+function invalidateCache(...keys) {
+  keys.forEach((k) => cacheStore.delete(k));
+}
 
 const JWT_SECRET = process.env.JWT_SECRET;
 
@@ -161,8 +196,12 @@ app.get("/api/auth/me", auth(), async (req, res) => {
 /* ---------------- TEAMS (read-only) ---------------- */
 // ใช้โดย: Badge.jsx/teamById() (ทุกที่ในเว็บที่โชว์สีทีม), กล่อง "สีทีมที่มีในระบบ" ในหน้าแอดมิน AdminStudents.jsx
 app.get("/api/teams", async (req, res) => {
-  const { rows } = await pool.query("SELECT * FROM teams ORDER BY id");
-  res.json(rows);
+  try {
+    const rows = await getCached("teams", async () => (await pool.query("SELECT * FROM teams ORDER BY id")).rows);
+    res.json(rows);
+  } catch {
+    res.status(503).json({ message: "เซิร์ฟเวอร์กำลังมีคนใช้งานหนาแน่น กรุณาลองใหม่อีกครั้ง" });
+  }
 });
 // เฉพาะแอดมิน — แก้ไขชื่อ/สีของทีม (เช่น เปลี่ยน "สีเหลือง" เป็นชื่ออื่น)
 app.patch("/api/teams/:id", auth("admin"), async (req, res) => {
@@ -176,6 +215,7 @@ app.patch("/api/teams/:id", auth("admin"), async (req, res) => {
       [name || null, accent || null, req.params.id]
     );
     if (!rows[0]) return res.status(404).json({ message: "ไม่พบทีมนี้" });
+    invalidateCache("teams");
     res.json(rows[0]);
   } catch (err) {
     res.status(400).json({ message: err.message });
@@ -185,8 +225,12 @@ app.patch("/api/teams/:id", auth("admin"), async (req, res) => {
 /* ---------------- ROLES (ตำแหน่ง/ประเภทกีฬา) ---------------- */
 // ใช้โดย: กล่อง "ตำแหน่ง/ประเภทกีฬาที่มีในระบบ" ในหน้าแอดมิน AdminStudents.jsx, dropdown ตำแหน่งตอนเพิ่ม/แก้นักศึกษา
 app.get("/api/roles", async (req, res) => {
-  const { rows } = await pool.query("SELECT name FROM roles ORDER BY id");
-  res.json(rows.map((r) => r.name));
+  try {
+    const rows = await getCached("roles", async () => (await pool.query("SELECT name FROM roles ORDER BY id")).rows);
+    res.json(rows.map((r) => r.name));
+  } catch {
+    res.status(503).json({ message: "เซิร์ฟเวอร์กำลังมีคนใช้งานหนาแน่น กรุณาลองใหม่อีกครั้ง" });
+  }
 });
 
 // เฉพาะแอดมินเท่านั้นที่เพิ่มตำแหน่งใหม่ได้
@@ -200,6 +244,7 @@ app.post("/api/roles", auth("admin"), async (req, res) => {
       "INSERT INTO roles (name) VALUES ($1) ON CONFLICT (name) DO NOTHING",
       [name.trim()]
     );
+    invalidateCache("roles");
     const { rows } = await pool.query("SELECT name FROM roles ORDER BY id");
     res.status(201).json(rows.map((r) => r.name));
   } catch (err) {
@@ -216,6 +261,7 @@ app.delete("/api/roles/:name", auth("admin"), async (req, res) => {
       return res.status(400).json({ message: `ลบไม่ได้ เพราะมีนักศึกษา ${inUse[0].count} คนใช้ตำแหน่งนี้อยู่` });
     }
     await pool.query("DELETE FROM roles WHERE name = $1", [name]);
+    invalidateCache("roles");
     const { rows } = await pool.query("SELECT name FROM roles ORDER BY id");
     res.json(rows.map((r) => r.name));
   } catch (err) {
@@ -226,8 +272,12 @@ app.delete("/api/roles/:name", auth("admin"), async (req, res) => {
 /* ---------------- STUDENT YEARS (ชั้นปี) ---------------- */
 // ใช้โดย: กล่อง "ชั้นปีที่มีในระบบ" ในหน้าแอดมิน AdminStudents.jsx, dropdown ชั้นปีตอนเพิ่ม/แก้นักศึกษา
 app.get("/api/student-years", async (req, res) => {
-  const { rows } = await pool.query("SELECT label FROM student_years ORDER BY id");
-  res.json(rows.map((r) => r.label));
+  try {
+    const rows = await getCached("student-years", async () => (await pool.query("SELECT label FROM student_years ORDER BY id")).rows);
+    res.json(rows.map((r) => r.label));
+  } catch {
+    res.status(503).json({ message: "เซิร์ฟเวอร์กำลังมีคนใช้งานหนาแน่น กรุณาลองใหม่อีกครั้ง" });
+  }
 });
 
 // เฉพาะแอดมินเท่านั้นที่เพิ่มชั้นปีใหม่ได้
@@ -241,6 +291,7 @@ app.post("/api/student-years", auth("admin"), async (req, res) => {
       "INSERT INTO student_years (label) VALUES ($1) ON CONFLICT (label) DO NOTHING",
       [label.trim()]
     );
+    invalidateCache("student-years");
     const { rows } = await pool.query("SELECT label FROM student_years ORDER BY id");
     res.status(201).json(rows.map((r) => r.label));
   } catch (err) {
@@ -257,6 +308,7 @@ app.delete("/api/student-years/:label", auth("admin"), async (req, res) => {
       return res.status(400).json({ message: `ลบไม่ได้ เพราะมีนักศึกษา ${inUse[0].count} คนอยู่ชั้นปีนี้` });
     }
     await pool.query("DELETE FROM student_years WHERE label = $1", [label]);
+    invalidateCache("student-years");
     const { rows } = await pool.query("SELECT label FROM student_years ORDER BY id");
     res.json(rows.map((r) => r.label));
   } catch (err) {
@@ -296,8 +348,12 @@ async function assertRoleLimit(team, role, excludeId) {
 }
 
 app.get("/api/students", async (req, res) => {
-  const { rows } = await pool.query("SELECT * FROM students ORDER BY id");
-  res.json(rows.map(mapStudent));
+  try {
+    const rows = await getCached("students", async () => (await pool.query("SELECT * FROM students ORDER BY id")).rows);
+    res.json(rows.map(mapStudent));
+  } catch {
+    res.status(503).json({ message: "เซิร์ฟเวอร์กำลังมีคนใช้งานหนาแน่น กรุณาลองใหม่อีกครั้ง" });
+  }
 });
 
 app.post("/api/students", auth("admin"), async (req, res) => {
@@ -317,6 +373,7 @@ app.post("/api/students", auth("admin"), async (req, res) => {
        VALUES ($1, crypt($1, gen_salt('bf')), 'student', $1, $2)`,
       [id, name]
     );
+    invalidateCache("students");
     res.status(201).json(mapStudent(rows[0]));
   } catch (err) {
     res.status(err.status || 400).json({ message: err.message });
@@ -380,6 +437,7 @@ app.put("/api/students/:id", auth(), async (req, res) => {
        WHERE id = $6 RETURNING *`,
       [name ?? null, team ?? null, role ?? null, canCheckin ?? null, year ?? null, req.params.id]
     );
+    invalidateCache("students");
     res.json(mapStudent(rows[0]));
   } catch (err) {
     res.status(err.status || 400).json({ message: err.message });
@@ -388,6 +446,7 @@ app.put("/api/students/:id", auth(), async (req, res) => {
 
 app.delete("/api/students/:id", auth("admin"), async (req, res) => {
   await pool.query("DELETE FROM students WHERE id = $1", [req.params.id]);
+  invalidateCache("students");
   res.status(204).end();
 });
 
@@ -395,8 +454,12 @@ app.delete("/api/students/:id", auth("admin"), async (req, res) => {
 // ใช้โดย: หน้าแอดมิน AdminMatches.jsx (สร้าง/แก้ผลแข่ง), Bracket.jsx + MatchSchedule.jsx ฝั่งนักศึกษา
 // (โชว์สายการแข่งขัน), Standings.jsx (นับแชมป์), UserCheckin.jsx (หาแมตช์วันนี้ของกีฬาที่จะเช็คชื่อ)
 app.get("/api/matches", async (req, res) => {
-  const { rows } = await pool.query("SELECT * FROM matches ORDER BY date, time");
-  res.json(rows.map(mapMatch));
+  try {
+    const rows = await getCached("matches", async () => (await pool.query("SELECT * FROM matches ORDER BY date, time")).rows);
+    res.json(rows.map(mapMatch));
+  } catch {
+    res.status(503).json({ message: "เซิร์ฟเวอร์กำลังมีคนใช้งานหนาแน่น กรุณาลองใหม่อีกครั้ง" });
+  }
 });
 
 app.post("/api/matches", auth("admin"), async (req, res) => {
@@ -410,6 +473,7 @@ app.post("/api/matches", auth("admin"), async (req, res) => {
        VALUES ($1,$2,$3,$4,$5,$6,'กำหนดการ',$7) RETURNING *`,
       [sport, teamA, teamB, date, time || null, venue || null, round || "รอบรองชนะเลิศ"]
     );
+    invalidateCache("matches");
     res.status(201).json(mapMatch(rows[0]));
   } catch (err) {
     res.status(400).json({ message: err.message });
@@ -434,19 +498,25 @@ app.put("/api/matches/:id", auth("admin"), async (req, res) => {
     [scoreA ?? null, scoreB ?? null, status ?? null, note ?? null, round ?? null, date ?? null, time ?? null, venue ?? null, teamA ?? null, teamB ?? null, req.params.id]
   );
   if (!rows[0]) return res.status(404).json({ message: "ไม่พบรายการแข่งขัน" });
+  invalidateCache("matches");
   res.json(mapMatch(rows[0]));
 });
 
 app.delete("/api/matches/:id", auth("admin"), async (req, res) => {
   await pool.query("DELETE FROM matches WHERE id = $1", [req.params.id]);
+  invalidateCache("matches");
   res.status(204).end();
 });
 
 /* ---------------- NEWS ---------------- */
 // ใช้โดย: หน้าแอดมิน AdminNews.jsx (ประกาศ/ลบข่าว), UserHome.jsx + GuestHome.jsx (โชว์ข่าวล่าสุด), TodaySummary.jsx
 app.get("/api/news", async (req, res) => {
-  const { rows } = await pool.query("SELECT * FROM news ORDER BY date DESC, id DESC");
-  res.json(rows.map(mapNews));
+  try {
+    const rows = await getCached("news", async () => (await pool.query("SELECT * FROM news ORDER BY date DESC, id DESC")).rows);
+    res.json(rows.map(mapNews));
+  } catch {
+    res.status(503).json({ message: "เซิร์ฟเวอร์กำลังมีคนใช้งานหนาแน่น กรุณาลองใหม่อีกครั้ง" });
+  }
 });
 
 app.post("/api/news", auth("admin"), async (req, res) => {
@@ -456,11 +526,13 @@ app.post("/api/news", auth("admin"), async (req, res) => {
     "INSERT INTO news (title, body) VALUES ($1,$2) RETURNING *",
     [title, body || null]
   );
+  invalidateCache("news");
   res.status(201).json(mapNews(rows[0]));
 });
 
 app.delete("/api/news/:id", auth("admin"), async (req, res) => {
   await pool.query("DELETE FROM news WHERE id = $1", [req.params.id]);
+  invalidateCache("news");
   res.status(204).end();
 });
 
@@ -468,8 +540,12 @@ app.delete("/api/news/:id", auth("admin"), async (req, res) => {
 // ใช้โดย: หน้าแอดมิน AdminEventDays.jsx (กำหนดวัน) และปฏิทินในหน้า UserHistory.jsx ฝั่งนักศึกษา
 // (ตัดสินว่าวันไหนควรนับว่ามา/ขาด/ยังไม่เริ่ม)
 app.get("/api/event-days", async (req, res) => {
-  const { rows } = await pool.query("SELECT * FROM event_days ORDER BY date");
-  res.json(rows.map(mapEventDay));
+  try {
+    const rows = await getCached("event-days", async () => (await pool.query("SELECT * FROM event_days ORDER BY date")).rows);
+    res.json(rows.map(mapEventDay));
+  } catch {
+    res.status(503).json({ message: "เซิร์ฟเวอร์กำลังมีคนใช้งานหนาแน่น กรุณาลองใหม่อีกครั้ง" });
+  }
 });
 
 // เฉพาะแอดมินเท่านั้นที่กำหนดวันจัดกิจกรรมได้ (เลือกวันที่ผ่านปฏิทินในหน้าเว็บ)
@@ -485,6 +561,7 @@ app.post("/api/event-days", auth("admin"), async (req, res) => {
         [d, label || null]
       );
     }
+    invalidateCache("event-days");
     const { rows } = await pool.query("SELECT * FROM event_days ORDER BY date");
     res.status(201).json(rows.map(mapEventDay));
   } catch (err) {
@@ -502,6 +579,7 @@ app.put("/api/event-days/:id", auth("admin"), async (req, res) => {
       label || null,
       req.params.id,
     ]);
+    invalidateCache("event-days");
     const { rows } = await pool.query("SELECT * FROM event_days ORDER BY date");
     res.json(rows.map(mapEventDay));
   } catch (err) {
@@ -511,6 +589,7 @@ app.put("/api/event-days/:id", auth("admin"), async (req, res) => {
 
 app.delete("/api/event-days/:id", auth("admin"), async (req, res) => {
   await pool.query("DELETE FROM event_days WHERE id = $1", [req.params.id]);
+  invalidateCache("event-days");
   const { rows } = await pool.query("SELECT * FROM event_days ORDER BY date");
   res.json(rows.map(mapEventDay));
 });
@@ -525,8 +604,12 @@ const CHECKINS_WITH_CHECKER_SQL = `
 `;
 
 app.get("/api/checkins", async (req, res) => {
-  const { rows } = await pool.query(`${CHECKINS_WITH_CHECKER_SQL} ORDER BY c.id`);
-  res.json(rows.map(mapCheckin));
+  try {
+    const rows = await getCached("checkins", async () => (await pool.query(`${CHECKINS_WITH_CHECKER_SQL} ORDER BY c.id`)).rows);
+    res.json(rows.map(mapCheckin));
+  } catch {
+    res.status(503).json({ message: "เซิร์ฟเวอร์กำลังมีคนใช้งานหนาแน่น กรุณาลองใหม่อีกครั้ง" });
+  }
 });
 
 // ตรวจสอบว่า req.user มีสิทธิ์ "เช็คชื่อ/เช็คขาด/ส่งข้อความ" แทนนักศึกษาคนนี้ได้หรือไม่
@@ -603,6 +686,7 @@ app.post("/api/checkins", auth(), async (req, res) => {
       "INSERT INTO checkins (student_id, match_id, time, date, status, checked_by_id) VALUES ($1,$2,$3, COALESCE($4, CURRENT_DATE), $5, $6) RETURNING id",
       [studentId, matchId ?? null, time || null, finalDate, finalStatus, req.user.id]
     );
+    invalidateCache("checkins");
     const { rows: withChecker } = await pool.query(`${CHECKINS_WITH_CHECKER_SQL} WHERE c.id = $1`, [rows[0].id]);
     res.status(201).json(mapCheckin(withChecker[0]));
   } catch (err) {
@@ -621,6 +705,7 @@ app.delete("/api/checkins/:id", auth(), async (req, res) => {
   if (!allowed) return;
 
   await pool.query("DELETE FROM checkins WHERE id = $1", [req.params.id]);
+  invalidateCache("checkins");
   res.json({ ok: true });
 });
 
@@ -638,6 +723,7 @@ app.put("/api/checkins/:id", auth("admin"), async (req, res) => {
     [status ?? null, time ?? null, date ?? null, req.params.id]
   );
   if (!rows[0]) return res.status(404).json({ message: "ไม่พบรายการเช็คชื่อนี้" });
+  invalidateCache("checkins");
   const { rows: withChecker } = await pool.query(`${CHECKINS_WITH_CHECKER_SQL} WHERE c.id = $1`, [rows[0].id]);
   res.json(mapCheckin(withChecker[0]));
 });
