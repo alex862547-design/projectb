@@ -252,6 +252,41 @@ app.post("/api/roles", auth("admin"), async (req, res) => {
   }
 });
 
+// เฉพาะแอดมินเท่านั้นที่แก้ไข/เปลี่ยนชื่อตำแหน่งได้ — เปลี่ยนชื่อใน roles พร้อมอัปเดตนักศึกษาทุกคนที่ใช้ตำแหน่ง
+// เดิมให้เป็นชื่อใหม่ในธุรกรรมเดียวกัน (ไม่ต้องลบ+เพิ่มใหม่แล้วไปไล่แก้นักศึกษาทีละคนเอง) ห้ามเปลี่ยนไปเป็นชื่อ
+// ที่มีอยู่แล้ว (กันไปรวมกับตำแหน่งอื่นโดยไม่ตั้งใจ — ถ้าต้องการรวมจริงๆ ให้ลบตำแหน่งเดิมแทนหลังย้ายคนออกหมดแล้ว)
+app.put("/api/roles/:name", auth("admin"), async (req, res) => {
+  const oldName = decodeURIComponent(req.params.name);
+  const newName = (req.body.newName || "").trim();
+  if (!newName) return res.status(400).json({ message: "กรุณาระบุชื่อตำแหน่งใหม่" });
+  if (newName === oldName) return res.status(400).json({ message: "ชื่อใหม่เหมือนชื่อเดิม" });
+
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const { rows: existing } = await client.query("SELECT 1 FROM roles WHERE name = $1", [newName]);
+    if (existing.length > 0) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({ message: "มีตำแหน่งชื่อนี้อยู่แล้ว" });
+    }
+    const { rowCount } = await client.query("UPDATE roles SET name = $1 WHERE name = $2", [newName, oldName]);
+    if (rowCount === 0) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ message: "ไม่พบตำแหน่งนี้" });
+    }
+    await client.query("UPDATE students SET role = $1 WHERE role = $2", [newName, oldName]);
+    await client.query("COMMIT");
+    invalidateCache("roles", "students");
+    const { rows } = await pool.query("SELECT name FROM roles ORDER BY id");
+    res.json(rows.map((r) => r.name));
+  } catch (err) {
+    await client.query("ROLLBACK");
+    res.status(400).json({ message: err.message });
+  } finally {
+    client.release();
+  }
+});
+
 // เฉพาะแอดมินเท่านั้นที่ลบตำแหน่งได้ — ลบไม่ได้ถ้ายังมีนักศึกษาใช้ตำแหน่งนี้อยู่ (กันข้อมูลนักศึกษาพัง)
 app.delete("/api/roles/:name", auth("admin"), async (req, res) => {
   const name = decodeURIComponent(req.params.name);
@@ -296,6 +331,40 @@ app.post("/api/student-years", auth("admin"), async (req, res) => {
     res.status(201).json(rows.map((r) => r.label));
   } catch (err) {
     res.status(400).json({ message: err.message });
+  }
+});
+
+// เฉพาะแอดมินเท่านั้นที่แก้ไข/เปลี่ยนชื่อชั้นปีได้ — เปลี่ยนชื่อใน student_years พร้อมอัปเดตนักศึกษาทุกคนที่อยู่
+// ชั้นปีเดิมให้เป็นชื่อใหม่ในธุรกรรมเดียวกัน (เหมือนการเปลี่ยนชื่อตำแหน่งด้านบน)
+app.put("/api/student-years/:label", auth("admin"), async (req, res) => {
+  const oldLabel = decodeURIComponent(req.params.label);
+  const newLabel = (req.body.newLabel || "").trim();
+  if (!newLabel) return res.status(400).json({ message: "กรุณาระบุชื่อชั้นปีใหม่" });
+  if (newLabel === oldLabel) return res.status(400).json({ message: "ชื่อใหม่เหมือนชื่อเดิม" });
+
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const { rows: existing } = await client.query("SELECT 1 FROM student_years WHERE label = $1", [newLabel]);
+    if (existing.length > 0) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({ message: "มีชั้นปีชื่อนี้อยู่แล้ว" });
+    }
+    const { rowCount } = await client.query("UPDATE student_years SET label = $1 WHERE label = $2", [newLabel, oldLabel]);
+    if (rowCount === 0) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ message: "ไม่พบชั้นปีนี้" });
+    }
+    await client.query("UPDATE students SET year = $1 WHERE year = $2", [newLabel, oldLabel]);
+    await client.query("COMMIT");
+    invalidateCache("student-years", "students");
+    const { rows } = await pool.query("SELECT label FROM student_years ORDER BY id");
+    res.json(rows.map((r) => r.label));
+  } catch (err) {
+    await client.query("ROLLBACK");
+    res.status(400).json({ message: err.message });
+  } finally {
+    client.release();
   }
 });
 
