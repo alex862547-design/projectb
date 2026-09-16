@@ -90,6 +90,7 @@ const mapCheckin = (row) => ({
   time: row.time,
   date: toDateStr(row.date),
   status: row.status || "present",
+  editedAt: row.edited_at,
   checkedBy: row.checked_by_id
     ? {
         name: row.checked_by_name,
@@ -794,9 +795,10 @@ app.put("/api/checkins/:id", auth("admin"), async (req, res) => {
   const { status, time, date } = req.body;
   const { rows } = await pool.query(
     `UPDATE checkins
-     SET status = COALESCE($1, status),
-         time   = COALESCE($2, time),
-         date   = COALESCE($3, date)
+     SET status    = COALESCE($1, status),
+         time      = COALESCE($2, time),
+         date      = COALESCE($3, date),
+         edited_at = NOW()
      WHERE id = $4 RETURNING id`,
     [status ?? null, time ?? null, date ?? null, req.params.id]
   );
