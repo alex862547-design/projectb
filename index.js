@@ -734,16 +734,25 @@ app.post("/api/checkins", auth(), async (req, res) => {
   }
   const finalStatus = status === "absent" ? "absent" : "present";
 
-  let finalDate = null; // null -> ให้ query ใช้ CURRENT_DATE
+  const { rows: nowRows } = await pool.query("SELECT CURRENT_DATE AS today");
+  const todayStr = toDateStr(nowRows[0].today);
+
+  let finalDate = todayStr;
   if (date) {
     if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) {
       return res.status(400).json({ message: "รูปแบบวันที่ไม่ถูกต้อง" });
     }
-    const { rows: nowRows } = await pool.query("SELECT CURRENT_DATE AS today");
-    if (date > toDateStr(nowRows[0].today)) {
+    if (date > todayStr) {
       return res.status(400).json({ message: "เช็คชื่อล่วงหน้าไม่ได้ เลือกได้แค่วันนี้หรือวันที่ผ่านมาแล้ว" });
     }
     finalDate = date;
+  }
+
+  // เช็คชื่อได้แค่วันที่เป็น "วันจัดกิจกรรม" ที่แอดมินตั้งไว้ใน event_days เท่านั้น (กันเช็คชื่อวันที่ไม่มี
+  // กิจกรรมเลย ซึ่งจะทำให้ปฏิทิน/กราฟสรุปในหน้า "ประวัติของฉัน" เพี้ยน เพราะกราฟนั้นนับจากวันจัดกิจกรรมเท่านั้น)
+  const { rows: eventDayRows } = await pool.query("SELECT 1 FROM event_days WHERE date = $1", [finalDate]);
+  if (eventDayRows.length === 0) {
+    return res.status(400).json({ message: "วันที่นี้ไม่ใช่วันจัดกิจกรรม ไม่สามารถเช็คชื่อได้" });
   }
 
   const allowed = await assertCanActOnStudent(req, res, studentId);
@@ -752,7 +761,7 @@ app.post("/api/checkins", auth(), async (req, res) => {
   try {
     // checked_by_id = req.user.id เก็บไว้ว่าใครเป็นคนกดเช็คให้ (ตัวเอง/เจ้าหน้าที่ทีม/แอดมิน) เอาไว้โชว์ในหน้าต่างข้อความทีหลัง
     const { rows } = await pool.query(
-      "INSERT INTO checkins (student_id, match_id, time, date, status, checked_by_id) VALUES ($1,$2,$3, COALESCE($4, CURRENT_DATE), $5, $6) RETURNING id",
+      "INSERT INTO checkins (student_id, match_id, time, date, status, checked_by_id) VALUES ($1,$2,$3,$4,$5,$6) RETURNING id",
       [studentId, matchId ?? null, time || null, finalDate, finalStatus, req.user.id]
     );
     invalidateCache("checkins");
