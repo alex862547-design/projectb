@@ -907,6 +907,35 @@ app.delete("/api/checkin-confirmations/:id", auth(), async (req, res) => {
   res.json({ ok: true });
 });
 
+/* ---------------- SITE VISITS (ยอดเข้าชมเว็บวันนี้) ---------------- */
+// ใช้โดย: TodaySummary.jsx (แบนเนอร์บนสุดของหน้าหลัก ทั้งฝั่งนักศึกษาและผู้เยี่ยมชม) — นับรวมทุกคนที่เปิดเว็บนี้
+// วันนี้ ไม่แยกบัญชี/ไม่แยกล็อกอินหรือไม่ ฝั่ง frontend ยิง POST ครั้งเดียวตอนแอปโหลดเสร็จต่อการเปิดหน้าเว็บ 1 ครั้ง
+app.get("/api/visits/today", async (req, res) => {
+  try {
+    const row = await getCached("visits-today", async () => {
+      const { rows } = await pool.query("SELECT count FROM site_visits WHERE date = CURRENT_DATE");
+      return rows[0] || { count: 0 };
+    });
+    res.json({ count: row.count });
+  } catch {
+    res.status(503).json({ message: "เซิร์ฟเวอร์กำลังมีคนใช้งานหนาแน่น กรุณาลองใหม่อีกครั้ง" });
+  }
+});
+
+app.post("/api/visits", async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      `INSERT INTO site_visits (date, count) VALUES (CURRENT_DATE, 1)
+       ON CONFLICT (date) DO UPDATE SET count = site_visits.count + 1
+       RETURNING count`
+    );
+    invalidateCache("visits-today");
+    res.status(201).json({ count: rows[0].count });
+  } catch (err) {
+    res.status(400).json({ message: err.message });
+  }
+});
+
 /* ---------------- ATTENDANCE MESSAGES (สนทนาเรื่องการเช็คชื่อ/เช็คขาด) ---------------- */
 // ใช้โดย: AttendanceThreadModal.jsx (ป็อปอัปแชท เปิดจาก UserCheckin.jsx และ UserHistory.jsx),
 // MessageInboxModal.jsx (กล่องข้อความรวมทุกห้องแชท ใช้ /threads กับ /checker-unread-count)
