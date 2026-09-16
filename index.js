@@ -797,6 +797,107 @@ app.put("/api/checkins/:id", auth("admin"), async (req, res) => {
   res.json(mapCheckin(withChecker[0]));
 });
 
+/* ---------------- CHECKIN CONFIRMATIONS (ยืนยันว่าข้อมูลเช็คชื่อของสี+ตำแหน่ง+วันที่นี้เช็คครบถูกต้องแล้ว) ---------------- */
+// ใช้โดย: UserCheckin.jsx — ปุ่ม "ยืนยันข้อมูลทั้งหมด" ต่อจากรายชื่อของตำแหน่ง/กิจกรรมที่กำลังดูอยู่
+// คนละเรื่องกับ checkins (ซึ่งเป็นแค่รายการเช็คชื่อ/เช็คขาดของนักศึกษาแต่ละคน) — ตารางนี้เป็นแค่ "ป้ายยืนยัน"
+// ระดับสี+ตำแหน่ง+วัน ไว้บอกว่าผู้เช็คชื่อตรวจทานแล้วว่าข้อมูลของกลุ่มนี้ในวันนี้ถูกต้องครบถ้วน ไม่ได้ล็อกห้ามแก้ไข
+// checkins ต่อ (ยังกดเช็คชื่อ/แก้ไขเพิ่มได้ตามปกติ) ยืนยันซ้ำได้เรื่อยๆ (แค่ upsert วันเวลา+ผู้ยืนยันล่าสุด)
+const mapConfirmation = (row) => ({
+  id: row.id,
+  team: row.team,
+  role: row.role,
+  date: toDateStr(row.date),
+  confirmedAt: row.confirmed_at,
+  confirmedBy: row.confirmed_by_id
+    ? {
+        name: row.confirmed_by_name,
+        code: row.confirmed_by_role === "admin" ? null : row.confirmed_by_student_id,
+        isAdmin: row.confirmed_by_role === "admin",
+      }
+    : null,
+});
+const CONFIRMATIONS_WITH_CONFIRMER_SQL = `
+  SELECT cc.*, u.display_name AS confirmed_by_name, u.student_id AS confirmed_by_student_id, u.role AS confirmed_by_role
+  FROM checkin_confirmations cc
+  LEFT JOIN users u ON u.id = cc.confirmed_by_id
+`;
+
+// ตรวจสอบสิทธิ์ "ยืนยัน/ยกเลิกยืนยัน" ข้อมูลของสี+ตำแหน่งนี้ — ใช้เงื่อนไขเดียวกับสิทธิ์เช็คชื่อจริง
+// (assertCanActOnStudent) แต่เทียบกับสี+ตำแหน่งตรงๆ ไม่ต้องมีนักศึกษาคนใดคนหนึ่งอ้างอิง
+async function assertCanConfirmTeamRole(req, res, team, role) {
+  if (req.user.role === "admin") return true;
+  if (req.user.role !== "student") {
+    res.status(403).json({ message: "คุณไม่มีสิทธิ์ทำรายการนี้" });
+    return false;
+  }
+  const { rows: meRows } = await pool.query(
+    "SELECT team, role, can_checkin FROM students WHERE id = $1",
+    [req.user.studentId]
+  );
+  const me = meRows[0];
+  if (!me || !me.can_checkin) {
+    res.status(403).json({ message: "คุณไม่ได้รับสิทธิ์ให้เช็คชื่อ กรุณาติดต่อผู้ดูแลระบบ" });
+    return false;
+  }
+  if (me.team !== team) {
+    res.status(403).json({ message: "ยืนยันได้เฉพาะข้อมูลของสีเดียวกันเท่านั้น" });
+    return false;
+  }
+  if (me.role !== "หัวหน้าสี" && me.role !== role) {
+    res.status(403).json({ message: "ยืนยันได้เฉพาะตำแหน่ง/กีฬาเดียวกับคุณเท่านั้น" });
+    return false;
+  }
+  return true;
+}
+
+app.get("/api/checkin-confirmations", async (req, res) => {
+  try {
+    const rows = await getCached(
+      "checkin-confirmations",
+      async () => (await pool.query(`${CONFIRMATIONS_WITH_CONFIRMER_SQL} ORDER BY cc.id`)).rows
+    );
+    res.json(rows.map(mapConfirmation));
+  } catch {
+    res.status(503).json({ message: "เซิร์ฟเวอร์กำลังมีคนใช้งานหนาแน่น กรุณาลองใหม่อีกครั้ง" });
+  }
+});
+
+// ยืนยัน (หรือยืนยันซ้ำ) ว่าข้อมูลเช็คชื่อของสี+ตำแหน่ง+วันที่นี้ถูกต้องครบถ้วนแล้ว — upsert ทับของเดิมถ้ามีอยู่แล้ว
+app.post("/api/checkin-confirmations", auth(), async (req, res) => {
+  const { team, role, date } = req.body;
+  if (!team || !role || !date) {
+    return res.status(400).json({ message: "ต้องระบุ team, role, date" });
+  }
+  const allowed = await assertCanConfirmTeamRole(req, res, team, role);
+  if (!allowed) return;
+  try {
+    const { rows } = await pool.query(
+      `INSERT INTO checkin_confirmations (team, role, date, confirmed_by_id, confirmed_at)
+       VALUES ($1,$2,$3,$4,NOW())
+       ON CONFLICT (team, role, date) DO UPDATE SET confirmed_by_id = $4, confirmed_at = NOW()
+       RETURNING id`,
+      [team, role, date, req.user.id]
+    );
+    invalidateCache("checkin-confirmations");
+    const { rows: withConfirmer } = await pool.query(`${CONFIRMATIONS_WITH_CONFIRMER_SQL} WHERE cc.id = $1`, [rows[0].id]);
+    res.status(201).json(mapConfirmation(withConfirmer[0]));
+  } catch (err) {
+    res.status(400).json({ message: err.message });
+  }
+});
+
+// ยกเลิกการยืนยัน (กดผิด หรือมีการแก้ไขเช็คชื่อเพิ่มทีหลังจนอยากยืนยันใหม่) ใช้สิทธิ์เดียวกับตอนยืนยัน
+app.delete("/api/checkin-confirmations/:id", auth(), async (req, res) => {
+  const { rows } = await pool.query("SELECT team, role FROM checkin_confirmations WHERE id = $1", [req.params.id]);
+  const record = rows[0];
+  if (!record) return res.status(404).json({ message: "ไม่พบรายการยืนยันนี้" });
+  const allowed = await assertCanConfirmTeamRole(req, res, record.team, record.role);
+  if (!allowed) return;
+  await pool.query("DELETE FROM checkin_confirmations WHERE id = $1", [req.params.id]);
+  invalidateCache("checkin-confirmations");
+  res.json({ ok: true });
+});
+
 /* ---------------- ATTENDANCE MESSAGES (สนทนาเรื่องการเช็คชื่อ/เช็คขาด) ---------------- */
 // ใช้โดย: AttendanceThreadModal.jsx (ป็อปอัปแชท เปิดจาก UserCheckin.jsx และ UserHistory.jsx),
 // MessageInboxModal.jsx (กล่องข้อความรวมทุกห้องแชท ใช้ /threads กับ /checker-unread-count)
