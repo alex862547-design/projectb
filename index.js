@@ -437,10 +437,11 @@ app.post("/api/students", auth("admin"), async (req, res) => {
       "INSERT INTO students (id, name, team, role, year) VALUES ($1,$2,$3,$4,$5) RETURNING *",
       [id, name, team, role || null, year || null]
     );
-    // สร้างบัญชีล็อกอินให้นักศึกษาคนใหม่อัตโนมัติ (username/รหัสผ่านตั้งต้น = รหัสนักศึกษา)
+    // สร้างบัญชีล็อกอินให้นักศึกษาคนใหม่อัตโนมัติ — ชื่อผู้ใช้ = "usp" + รหัสนักศึกษา (กันชื่อผู้ใช้ตรงกับ
+    // รหัสนักศึกษาเป๊ะๆ ซึ่งเดาง่ายเกินไป) ส่วนรหัสผ่านตั้งต้นยังคงเป็นรหัสนักศึกษาเฉยๆ (ไม่มี usp นำหน้า)
     await pool.query(
       `INSERT INTO users (username, password_hash, role, student_id, display_name)
-       VALUES ($1, crypt($1, gen_salt('bf')), 'student', $1, $2)`,
+       VALUES ('usp' || $1, crypt($1, gen_salt('bf')), 'student', $1, $2)`,
       [id, name]
     );
     invalidateCache("students");
