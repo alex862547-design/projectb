@@ -694,10 +694,17 @@ app.get("/api/checkins", async (req, res) => {
 });
 
 // ตำแหน่งที่ขึ้นต้นด้วย "Staff" (เช่น "Staffกองเชียร์") คือเจ้าหน้าที่ดูแลตำแหน่งนั้น มีสิทธิ์เช็คชื่อ
-// "ตำแหน่งที่ตามหลัง Staff" แทนตำแหน่งของตัวเอง (คนละกลุ่มกัน) — ต้องตรงกับ checkinTargetRole ฝั่ง frontend เป๊ะๆ
+// "ตำแหน่งที่ตามหลัง Staff" ได้ด้วย นอกเหนือจากตำแหน่งตัวเอง — ต้องตรงกับฝั่ง frontend เป๊ะๆ
 function checkinTargetRole(role) {
   if (!role) return role;
   return role.startsWith("Staff") ? role.slice(5) : role;
+}
+
+// รายชื่อตำแหน่งทั้งหมดที่ role นี้เช็คชื่อได้ — ปกติมีแค่ตำแหน่งตัวเอง แต่ตำแหน่งที่ขึ้นต้นด้วย "Staff" จะเช็คได้
+// ทั้งตำแหน่งตัวเอง (เช่นเช็คชื่อกันเองใน Staffกองเชียร์) และตำแหน่งที่ตามหลัง Staff (เช่น กองเชียร์) ด้วย
+function checkinScopeRoles(role) {
+  const target = checkinTargetRole(role);
+  return target === role ? [role] : [role, target];
 }
 
 // ตรวจสอบว่า req.user มีสิทธิ์ "เช็คชื่อ/เช็คขาด/ส่งข้อความ" แทนนักศึกษาคนนี้ได้หรือไม่
@@ -735,7 +742,7 @@ async function assertCanActOnStudent(req, res, studentId) {
     res.status(403).json({ message: "ทำรายการได้เฉพาะนักศึกษาในสังกัดสีเดียวกันเท่านั้น" });
     return false;
   }
-  if (me.role !== "หัวหน้าสี" && target.role !== checkinTargetRole(me.role)) {
+  if (me.role !== "หัวหน้าสี" && !checkinScopeRoles(me.role).includes(target.role)) {
     res.status(403).json({ message: "ทำรายการได้เฉพาะนักศึกษาในตำแหน่ง/กีฬาเดียวกับคุณเท่านั้น" });
     return false;
   }
@@ -873,7 +880,7 @@ async function assertCanConfirmTeamRole(req, res, team, role) {
     res.status(403).json({ message: "ยืนยันได้เฉพาะข้อมูลของสีเดียวกันเท่านั้น" });
     return false;
   }
-  if (me.role !== "หัวหน้าสี" && checkinTargetRole(me.role) !== role) {
+  if (me.role !== "หัวหน้าสี" && !checkinScopeRoles(me.role).includes(role)) {
     res.status(403).json({ message: "ยืนยันได้เฉพาะตำแหน่ง/กีฬาเดียวกับคุณเท่านั้น" });
     return false;
   }
@@ -1037,8 +1044,8 @@ app.get("/api/attendance-messages/threads", auth(), async (req, res) => {
       teamFilter = "AND s.team = $1";
       params.push(me.team);
     } else {
-      teamFilter = "AND s.team = $1 AND s.role = $2";
-      params.push(me.team, checkinTargetRole(me.role));
+      teamFilter = "AND s.team = $1 AND s.role = ANY($2)";
+      params.push(me.team, checkinScopeRoles(me.role));
     }
   } else {
     return res.status(403).json({ message: "คุณไม่มีสิทธิ์เข้าดูกล่องข้อความนี้" });
@@ -1098,8 +1105,8 @@ app.get("/api/attendance-messages/checker-unread-count", auth(), async (req, res
     const { rows: meRows } = await pool.query("SELECT team, role, can_checkin FROM students WHERE id = $1", [req.user.studentId]);
     const me = meRows[0];
     if (!me || !me.can_checkin) return res.json({ count: 0 });
-    const scopeFilter = me.role === "หัวหน้าสี" ? "" : "AND s.role = $2";
-    const params = me.role === "หัวหน้าสี" ? [me.team] : [me.team, checkinTargetRole(me.role)];
+    const scopeFilter = me.role === "หัวหน้าสี" ? "" : "AND s.role = ANY($2)";
+    const params = me.role === "หัวหน้าสี" ? [me.team] : [me.team, checkinScopeRoles(me.role)];
     const { rows } = await pool.query(
       `SELECT COUNT(*)::int AS count FROM attendance_messages m
        JOIN students s ON s.id = m.student_id
