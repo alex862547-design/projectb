@@ -111,6 +111,15 @@ const mapAttendanceMessage = (row) => ({
   createdAt: row.created_at,
 });
 
+const mapAdminMessage = (row) => ({
+  id: row.id,
+  studentId: row.student_id,
+  senderRole: row.sender_role,
+  senderName: row.sender_name,
+  message: row.message,
+  createdAt: row.created_at,
+});
+
 const mapEventDay = (row) => ({
   id: row.id,
   date: toDateStr(row.date),
@@ -1115,6 +1124,125 @@ app.post("/api/attendance-messages", auth(), async (req, res) => {
       [studentId, date, senderRole, senderName, message.trim()]
     );
     res.status(201).json(mapAttendanceMessage(rows[0]));
+  } catch (err) {
+    res.status(400).json({ message: err.message });
+  }
+});
+
+/* ---------------- ADMIN MESSAGES (นักศึกษาส่งข้อความถึงแอดมินโดยตรง) ---------------- */
+// คนละเรื่องกับ attendance_messages (ซึ่งคุยกับ "ผู้เช็คชื่อ" เรื่องการเช็คชื่อของวันหนึ่งๆ) — ห้องแชทนี้คุยกับ
+// แอดมินตรงๆ ไม่ผูกวันที่ นักศึกษาคนหนึ่งมีห้องแชทกับแอดมินได้ห้องเดียว (รวมทุกข้อความไว้ในห้องเดียวกัน)
+// ใช้โดย: AdminMessageModal.jsx (ฝั่งนักศึกษา), AdminMessages.jsx (กล่องข้อความรวมของแอดมิน)
+
+// ตรวจว่า req.user มีสิทธิ์เข้าห้องแชทของนักศึกษาคนนี้ไหม — เจ้าตัวเองหรือแอดมินเท่านั้น (ไม่มีสิทธิ์ระดับ
+// "ผู้เช็คชื่อ" ในฟีเจอร์นี้ เพราะเป็นการคุยกับแอดมินตรงๆ ไม่เกี่ยวกับสี/ตำแหน่ง)
+function assertCanAccessAdminThread(req, res, studentId) {
+  if (req.user.role === "admin") return true;
+  if (req.user.role === "student" && req.user.studentId === studentId) return true;
+  res.status(403).json({ message: "คุณไม่มีสิทธิ์เข้าดูห้องแชทนี้" });
+  return false;
+}
+
+// ดูข้อความทั้งหมดในห้องแชทของนักศึกษาคนหนึ่ง — เปิดห้องนี้แล้วถือว่าอ่านข้อความของอีกฝั่งครบแล้ว
+app.get("/api/admin-messages", auth(), async (req, res) => {
+  const { studentId } = req.query;
+  if (!studentId) {
+    return res.status(400).json({ message: "ต้องระบุ studentId" });
+  }
+  if (!assertCanAccessAdminThread(req, res, studentId)) return;
+
+  const { rows } = await pool.query(
+    "SELECT * FROM admin_messages WHERE student_id = $1 ORDER BY id",
+    [studentId]
+  );
+
+  const readerRole = req.user.role === "admin" ? "student" : "admin"; // มาร์คว่าอ่านข้อความของ "อีกฝั่ง" แล้ว
+  await pool.query(
+    "UPDATE admin_messages SET is_read = TRUE WHERE student_id = $1 AND sender_role = $2 AND is_read = FALSE",
+    [studentId, readerRole]
+  );
+
+  res.json(rows.map(mapAdminMessage));
+});
+
+// จำนวนข้อความใหม่จากแอดมินที่นักศึกษายังไม่ได้เปิดอ่าน ใช้โชว์เลขแดงที่ปุ่ม "ข้อความถึงแอดมิน"
+app.get("/api/admin-messages/unread-count", auth(), async (req, res) => {
+  if (req.user.role !== "student" || !req.user.studentId) {
+    return res.json({ count: 0 });
+  }
+  const { rows } = await pool.query(
+    "SELECT COUNT(*)::int AS count FROM admin_messages WHERE student_id = $1 AND sender_role = 'admin' AND is_read = FALSE",
+    [req.user.studentId]
+  );
+  res.json({ count: rows[0]?.count || 0 });
+});
+
+// รายชื่อห้องแชททั้งหมด (นักศึกษา 1 คน = 1 ห้อง) เรียงจากข้อความล่าสุดก่อน — เฉพาะแอดมินเท่านั้นที่ดูได้
+app.get("/api/admin-messages/threads", auth("admin"), async (req, res) => {
+  const { rows } = await pool.query(`
+    WITH thread AS (
+      SELECT student_id, MAX(created_at) AS last_at
+      FROM admin_messages
+      GROUP BY student_id
+    )
+    SELECT t.student_id, t.last_at, s.name AS student_name,
+      lm.message AS last_message, lm.sender_role AS last_sender_role,
+      COALESCE(uc.unread, 0)::int AS unread_count
+    FROM thread t
+    JOIN students s ON s.id = t.student_id
+    JOIN LATERAL (
+      SELECT message, sender_role FROM admin_messages
+      WHERE student_id = t.student_id
+      ORDER BY created_at DESC, id DESC LIMIT 1
+    ) lm ON true
+    LEFT JOIN LATERAL (
+      SELECT COUNT(*) AS unread FROM admin_messages
+      WHERE student_id = t.student_id AND sender_role = 'student' AND is_read = FALSE
+    ) uc ON true
+    ORDER BY t.last_at DESC
+    LIMIT 200
+  `);
+
+  res.json(
+    rows.map((r) => ({
+      studentId: r.student_id,
+      studentName: r.student_name,
+      lastMessage: r.last_message,
+      lastSenderRole: r.last_sender_role,
+      lastAt: r.last_at,
+      unreadCount: r.unread_count,
+    }))
+  );
+});
+
+// จำนวนข้อความรวมจากนักศึกษาทุกคนที่แอดมินยังไม่ได้เปิดอ่าน ใช้โชว์เลขแดงที่แท็บ "ข้อความนักศึกษา" ฝั่งแอดมิน
+app.get("/api/admin-messages/admin-unread-count", auth("admin"), async (req, res) => {
+  const { rows } = await pool.query(
+    "SELECT COUNT(*)::int AS count FROM admin_messages WHERE sender_role = 'student' AND is_read = FALSE"
+  );
+  res.json({ count: rows[0]?.count || 0 });
+});
+
+// ส่งข้อความใหม่ — ถ้าคนส่งคือนักศึกษาเจ้าของห้อง sender_role = "student" มิฉะนั้น (แอดมิน) เป็น "admin"
+app.post("/api/admin-messages", auth(), async (req, res) => {
+  const { message } = req.body;
+  const studentId = req.user.role === "student" ? req.user.studentId : req.body.studentId;
+  if (!studentId || !message || !message.trim()) {
+    return res.status(400).json({ message: "ต้องระบุ studentId และข้อความ" });
+  }
+  if (!assertCanAccessAdminThread(req, res, studentId)) return;
+
+  const senderRole = req.user.role === "student" ? "student" : "admin";
+  const { rows: userRows } = await pool.query("SELECT display_name FROM users WHERE id = $1", [req.user.id]);
+  const senderName = userRows[0]?.display_name || (senderRole === "admin" ? "ผู้ดูแลระบบ" : "ไม่ทราบชื่อ");
+
+  try {
+    const { rows } = await pool.query(
+      `INSERT INTO admin_messages (student_id, sender_role, sender_name, message)
+       VALUES ($1,$2,$3,$4) RETURNING *`,
+      [studentId, senderRole, senderName, message.trim()]
+    );
+    res.status(201).json(mapAdminMessage(rows[0]));
   } catch (err) {
     res.status(400).json({ message: err.message });
   }
